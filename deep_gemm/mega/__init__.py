@@ -60,7 +60,13 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_max_tokens_per_rank: int, num_topk: int,
                                  hidden: int, intermediate_hidden: int,
                                  use_fp8_dispatch: bool = True,
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 chunk_tokens: int = None) -> SymmBuffer:
+    # When chunk_tokens is specified, use it instead of total num_max_tokens_per_rank
+    # This allows allocating a smaller buffer for chunked MoE processing
+    if chunk_tokens is not None:
+        num_max_tokens_per_rank = chunk_tokens
+
     # Token count must be aligned to block sizes
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -126,3 +132,46 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
+
+
+def fp8_fp4_chunked_mega_moe(y: torch.Tensor,
+                              x: Tuple[torch.Tensor, torch.Tensor],
+                              topk_idx: torch.Tensor,
+                              topk_weights: torch.Tensor,
+                              l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                              l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                              sym_buffer: SymmBuffer,
+                              chunk_size: int,
+                              cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                              recipe: Tuple[int, int, int] = (1, 1, 32),
+                              activation: str = 'swiglu',
+                              activation_clamp: Optional[float] = None,
+                              fast_math: bool = True):
+    # Process tokens in chunks to reduce peak memory usage
+    # x is a tuple of (x_fp8, x_sf) for all tokens
+    # sym_buffer should be allocated with chunk_tokens capacity (not total tokens)
+    total_tokens = x[0].size(0)
+    hidden = y.size(1)
+
+    for token_start in range(0, total_tokens, chunk_size):
+        token_end = min(token_start + chunk_size, total_tokens)
+        actual_chunk = token_end - token_start
+
+        # Copy chunk data into symmetric buffer views
+        sym_buffer.x[:actual_chunk].copy_(x[0][token_start:token_end])
+        sym_buffer.x_sf[:actual_chunk].copy_(x[1][token_start:token_end])
+        sym_buffer.topk_idx[:actual_chunk].copy_(topk_idx[token_start:token_end])
+        sym_buffer.topk_weights[:actual_chunk].copy_(topk_weights[token_start:token_end])
+
+        # Call the existing mega MoE kernel for this chunk
+        # Kernel writes directly into y slice, no extra copy
+        fp8_fp4_mega_moe(
+            y[token_start:token_end],
+            l1_weights, l2_weights,
+            sym_buffer,
+            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            recipe=recipe,
+            activation=activation,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math
+        )
