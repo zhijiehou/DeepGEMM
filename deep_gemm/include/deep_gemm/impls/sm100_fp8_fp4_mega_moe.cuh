@@ -32,7 +32,7 @@ template <
     uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
-    float kActivationClamp,
+    uint32_t kActivationClampBits,
     bool kFastMath,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1002,7 +1002,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
 
                             // Clamp
-                            if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                            // NOTES: NVCC 13.x cudafe++ rejects float as NTTP, so we pass bits as uint32_t
+                            if constexpr (kActivationClampBits != 0x7F800000u /* +inf */) {
+                                const float kActivationClamp = __uint_as_float(kActivationClampBits);
                                 bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
                                 bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});

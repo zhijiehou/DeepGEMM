@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>
 #include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
@@ -84,7 +85,7 @@ static void __instantiate_kernel() {{
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
-    to_string(args.activation_clamp),
+    [&]() { uint32_t b; std::memcpy(&b, &args.activation_clamp, sizeof(b)); return fmt::format("{}u", b); }(),
     args.fast_math ? "true" : "false");
     }
 
