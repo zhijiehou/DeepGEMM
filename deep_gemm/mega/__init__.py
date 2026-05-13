@@ -175,3 +175,122 @@ def fp8_fp4_chunked_mega_moe(y: torch.Tensor,
             activation_clamp=activation_clamp,
             fast_math=fast_math
         )
+
+
+class StreamingSymmBuffer:
+    """Symmetric buffer for streaming MegaMoE with barrier compression.
+
+    Buffer layout:
+    - Input data (x, x_sf, topk_idx, topk_weights): total_tokens_per_rank capacity
+    - Pool data (l1_acts, l1_acts_sf, l2_acts, l2_acts_sf): chunk_pool_tokens capacity
+    - Combine buffer: total_tokens_per_rank × num_topk capacity
+
+    The input views hold all chunks' data, while pool views are chunk-sized
+    (reused between chunks in the streaming kernel).
+    """
+    def __init__(self, group: dist.ProcessGroup,
+                 # MoE arguments
+                 num_experts: int,
+                 num_chunks: int,
+                 chunk_tokens_per_rank: int, num_topk: int,
+                 hidden: int, intermediate_hidden: int,
+                 use_fp8_dispatch: bool = True,
+                 activation: str = 'swiglu'):
+        self.group = group
+        self.num_experts = num_experts
+        self.num_chunks = num_chunks
+        self.chunk_tokens_per_rank = chunk_tokens_per_rank
+        self.total_tokens_per_rank = num_chunks * chunk_tokens_per_rank
+        self.num_topk = num_topk
+        self.hidden = hidden
+        self.intermediate_hidden = intermediate_hidden
+
+        # Allocate a symmetric buffer with streaming layout
+        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_streaming_mega_moe(
+            group.size(), num_experts,
+            num_chunks, chunk_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden,
+            use_fp8_dispatch, activation
+        )
+        self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
+        self.handle = symm_mem.rendezvous(self.buffer, group=group)
+        self.buffer.zero_()
+        self.group.barrier()
+        torch.cuda.synchronize()
+
+        # Create buffer views
+        (self.x, self.x_sf,
+         self.topk_idx, self.topk_weights,
+         self.l1_acts, self.l1_acts_sf,
+         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+
+    def destroy(self):
+        self.handle = None
+        self.buffer = None
+        self.group = None
+        self.x = None
+        self.x_sf = None
+
+
+def get_streaming_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
+                                            num_experts: int,
+                                            num_chunks: int,
+                                            chunk_tokens_per_rank: int,
+                                            num_topk: int,
+                                            hidden: int,
+                                            intermediate_hidden: int,
+                                            use_fp8_dispatch: bool = True,
+                                            activation: str = 'swiglu') -> StreamingSymmBuffer:
+    # Align chunk_tokens_per_rank to block sizes
+    chunk_tokens_per_rank = align(chunk_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+
+    return StreamingSymmBuffer(
+        group, num_experts,
+        num_chunks, chunk_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        use_fp8_dispatch, activation
+    )
+
+
+def fp8_fp4_streaming_mega_moe(y: torch.Tensor,
+                                x: Tuple[torch.Tensor, torch.Tensor],
+                                topk_idx: torch.Tensor,
+                                topk_weights: torch.Tensor,
+                                l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                                l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                                streaming_buffer: StreamingSymmBuffer,
+                                chunk_size: int,
+                                cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                                recipe: Tuple[int, int, int] = (1, 1, 32),
+                                activation: str = 'swiglu',
+                                activation_clamp: Optional[float] = None,
+                                fast_math: bool = True):
+    """Streaming MegaMoE with barrier compression.
+
+    Single kernel launch processing all chunks with barrier compression
+    (~2 NVLink barriers instead of ~2N). Pool buffer is reused between chunks.
+    """
+    total_tokens = x[0].size(0)
+
+    # Copy all input data into streaming buffer (total tokens)
+    streaming_buffer.x[:total_tokens].copy_(x[0])
+    streaming_buffer.x_sf[:total_tokens].copy_(x[1])
+    streaming_buffer.topk_idx[:total_tokens].copy_(topk_idx)
+    streaming_buffer.topk_weights[:total_tokens].copy_(topk_weights)
+
+    # Launch streaming kernel (single kernel, barrier compression)
+    _C.fp8_fp4_streaming_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        streaming_buffer.buffer,
+        streaming_buffer.handle.buffer_ptrs,
+        streaming_buffer.group.rank(),
+        streaming_buffer.num_chunks,
+        streaming_buffer.chunk_tokens_per_rank,
+        streaming_buffer.num_experts,
+        streaming_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
