@@ -479,6 +479,201 @@ def test_chunked(local_rank: int, num_local_ranks: int, args: argparse.Namespace
 
 
 
+# Test normal kernel chunk MegaMoE (Plan B: C++ host-driven loop)
+def test_normal_kernel(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+    rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    torch.manual_seed(42)
+    random.seed(42)
+
+    # Settings — same as test_chunked
+    hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
+    num_experts, num_topk = args.num_experts, args.num_topk
+    num_experts_per_rank = num_experts // num_ranks
+    num_max_tokens_per_rank = args.num_max_tokens_per_rank
+    chunk_size = args.chunk_size
+    aligned_chunk_size = deep_gemm.utils.math.align(chunk_size, deep_gemm._C.get_token_alignment_for_mega_moe())
+    total_tokens = args.num_tokens if args.num_tokens > 0 else num_max_tokens_per_rank
+    assert total_tokens <= num_max_tokens_per_rank, \
+        f'total_tokens ({total_tokens}) must <= num_max_tokens_per_rank ({num_max_tokens_per_rank})'
+
+    dist_print('Normal-kernel-chunk Test Config:', once_in_node=True)
+    dist_print(f' > Total tokens: {total_tokens}', once_in_node=True)
+    dist_print(f' > Max tokens per rank: {num_max_tokens_per_rank}', once_in_node=True)
+    dist_print(f' > Chunk size: {chunk_size} (aligned: {aligned_chunk_size})', once_in_node=True)
+    dist_print(f' > Num chunks: {math.ceil(total_tokens / aligned_chunk_size)}', once_in_node=True)
+    dist_print(f' > Hidden: {hidden}', once_in_node=True)
+    dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
+    dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
+    dist_print(once_in_node=True)
+
+    # Allocate buffers: a full-sized one for the baseline reference, and a
+    # chunk-sized one for the normal-kernel-chunk path.
+    buffer_full = deep_gemm.get_symm_buffer_for_mega_moe(
+        group, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden
+    )
+    buffer_normal = deep_gemm.get_symm_buffer_for_mega_moe(
+        group, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        chunk_tokens=chunk_size
+    )
+
+    dist_print('Buffer sizes:', once_in_node=True)
+    dist_print(f' > Baseline buffer (full): {buffer_full.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
+    dist_print(f' > Normal-kernel-chunk buffer: {buffer_normal.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
+    dist_print(f' > Memory saving: {(buffer_full.buffer.nbytes - buffer_normal.buffer.nbytes) / 2 ** 30:.3f} GiB ({1 - buffer_normal.buffer.nbytes / buffer_full.buffer.nbytes:.1%})', once_in_node=True)
+    dist_print(f' > Normal-kernel-chunk buffer capacity: {buffer_normal.num_max_tokens_per_rank} tokens', once_in_node=True)
+    dist_print(once_in_node=True)
+
+    from deep_gemm.utils.math import align as math_align
+    expected_capacity = math_align(chunk_size, deep_gemm._C.get_token_alignment_for_mega_moe())
+    assert buffer_normal.num_max_tokens_per_rank == expected_capacity, \
+        f'Normal-kernel-chunk buffer capacity {buffer_normal.num_max_tokens_per_rank} != expected {expected_capacity}'
+    dist_print(f' > Buffer capacity verification: PASSED ({buffer_normal.num_max_tokens_per_rank} == {expected_capacity})', once_in_node=True)
+
+    # Create inputs (identical to test_chunked)
+    x_bf16 = torch.randn((total_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    l1_weights_bf16 = torch.randn(
+        (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
+    l2_weights_bf16 = torch.randn(
+        (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
+    scores = torch.randn((total_tokens, num_experts), dtype=torch.float, device='cuda')
+    topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+
+    assert hidden % 128 == 0
+    assert intermediate_hidden % 128 == 0
+
+    x_fp8 = per_token_cast_to_fp8(x_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+
+    def cast_grouped_weights_to_fp4(bf16_weights):
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
+        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+        return w, w_sf
+
+    l1_weights = cast_grouped_weights_to_fp4(l1_weights_bf16)
+    l2_weights = cast_grouped_weights_to_fp4(l2_weights_bf16)
+    transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
+
+    # Reference: non-chunked baseline
+    buffer_full.x[:total_tokens].copy_(x_fp8[0])
+    buffer_full.x_sf[:total_tokens].copy_(x_fp8[1])
+    buffer_full.topk_idx[:total_tokens].copy_(topk_idx)
+    buffer_full.topk_weights[:total_tokens].copy_(topk_weights)
+
+    y_ref = torch.empty((total_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    deep_gemm.fp8_fp4_mega_moe(
+        y_ref,
+        transformed_l1_weights, transformed_l2_weights,
+        buffer_full,
+        activation_clamp=args.activation_clamp,
+        fast_math=bool(args.fast_math)
+    )
+    dist_print('Non-chunked reference run: DONE', once_in_node=True)
+
+    # Run normal-kernel-chunk mode
+    y_normal = torch.empty((total_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    deep_gemm.fp8_fp4_normal_kernel_chunk_mega_moe(
+        y_normal,
+        x_fp8,
+        topk_idx,
+        topk_weights,
+        transformed_l1_weights, transformed_l2_weights,
+        buffer_normal,
+        chunk_size=aligned_chunk_size,
+        activation_clamp=args.activation_clamp,
+        fast_math=bool(args.fast_math)
+    )
+    dist_print('Normal-kernel-chunk mode run: DONE', once_in_node=True)
+
+    max_diff = (y_ref - y_normal).abs().max().item()
+    mean_diff = (y_ref - y_normal).abs().mean().item()
+    dist_print(f'Output comparison:', once_in_node=True)
+    dist_print(f' > Max absolute diff: {max_diff:.6f}', once_in_node=True)
+    dist_print(f' > Mean absolute diff: {mean_diff:.6f}', once_in_node=True)
+
+    assert max_diff < 1e-3, f'Normal-kernel-chunk vs baseline max diff {max_diff} >= 1e-3'
+    dist_print(f' > Correctness test: PASSED (max_diff={max_diff:.6f} < 1e-3)', once_in_node=True)
+
+    gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
+    gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
+                      (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
+    num_recv_tokens = (gathered_topk_idx != -1).sum().item()
+
+    num_chunks_actual = math.ceil(total_tokens / aligned_chunk_size)
+
+    def run_normal_bench():
+        deep_gemm.fp8_fp4_normal_kernel_chunk_mega_moe(
+            y_normal,
+            x_fp8,
+            topk_idx,
+            topk_weights,
+            transformed_l1_weights, transformed_l2_weights,
+            buffer_normal,
+            chunk_size=aligned_chunk_size,
+            activation_clamp=args.activation_clamp,
+            fast_math=bool(args.fast_math)
+        )
+        return y_normal
+
+    for _ in range(5):
+        run_normal_bench()
+    torch.cuda.synchronize()
+
+    num_bench_iters = 30
+    times_ms = []
+    for _ in range(num_bench_iters):
+        torch.cuda._sleep(int(2e7))
+        dist.barrier()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        run_normal_bench()
+        end_event.record()
+        torch.cuda.synchronize()
+        times_ms.append(start_event.elapsed_time(end_event))
+    t_normal_total = sum(times_ms) / len(times_ms) / 1e3
+
+    safe_div = lambda a, b: float('nan') if b == 0 else a / b
+    tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_normal_total)
+
+    num_touched_experts = torch.unique(gathered_topk_idx.flatten()).numel() - 1
+    num_hbm_bytes = (
+        num_touched_experts * intermediate_hidden * 2 * hidden // 2 +
+        num_touched_experts * hidden * intermediate_hidden // 2 +
+        num_recv_tokens * hidden +
+        num_recv_tokens * intermediate_hidden +
+        num_recv_tokens * intermediate_hidden +
+        num_recv_tokens * hidden * 2
+    )
+    hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_normal_total)
+    num_nvlink_bytes = num_recv_tokens * hidden * 3
+    nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_normal_total)
+    t_reduction = total_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
+    approx_factor = t_normal_total / (t_normal_total - t_reduction)
+
+    dist_print('Normal-kernel-chunk Performance:')
+    dist_print(f' > EP: {rank_idx:2}/{num_ranks} | '
+               f'{num_chunks_actual} chunks | '
+               f'{tflops:4.0f} TFLOPS | '
+               f'overlap: '
+               f'{tflops * approx_factor:4.0f} TFLOPS, '
+               f'HBM {hbm_gbs * approx_factor:4.0f} GB/s, '
+               f'NVL {nvlink_gbs * approx_factor:3.0f} GB/s | '
+               f'{t_normal_total * 1e6:4.0f} us total, '
+               f'reduction: {t_reduction * 1e6:4.1f} us')
+
+    dist.barrier()
+    buffer_full.destroy()
+    buffer_normal.destroy()
+    dist.destroy_process_group()
+
+
 # Test streaming MegaMoE correctness and performance
 def test_streaming(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
@@ -709,6 +904,7 @@ if __name__ == '__main__':
     parser.add_argument('--chunk-size', type=int, default=4096, help='Chunk size for chunked/streaming MoE test')
     parser.add_argument('--test-chunked', action='store_true', help='Run chunked MoE correctness test')
     parser.add_argument('--test-streaming', action='store_true', help='Run streaming MoE correctness test')
+    parser.add_argument('--test-normal-kernel', action='store_true', help='Run normal-kernel-chunk MoE correctness test (Plan B: C++ host-driven loop)')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
@@ -726,6 +922,8 @@ if __name__ == '__main__':
             test_chunked(args.local_rank_idx, args.num_processes, args)
         elif args.test_streaming:
             test_streaming(args.local_rank_idx, args.num_processes, args)
+        elif args.test_normal_kernel:
+            test_normal_kernel(args.local_rank_idx, args.num_processes, args)
         else:
             test(args.local_rank_idx, args.num_processes, args)
     else:
@@ -735,5 +933,7 @@ if __name__ == '__main__':
             torch.multiprocessing.spawn(test_chunked, args=(num_processes, args), nprocs=num_processes)
         elif args.test_streaming:
             torch.multiprocessing.spawn(test_streaming, args=(num_processes, args), nprocs=num_processes)
+        elif args.test_normal_kernel:
+            torch.multiprocessing.spawn(test_normal_kernel, args=(num_processes, args), nprocs=num_processes)
         else:
             torch.multiprocessing.spawn(test, args=(num_processes, args), nprocs=num_processes)

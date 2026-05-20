@@ -10,6 +10,7 @@
 #endif
 #include "../jit/device_runtime.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_internal_chunk_mega_moe.hpp"
 
 namespace deep_gemm::mega {
 
@@ -536,11 +537,134 @@ static void fp8_fp4_streaming_mega_moe(
     }
 }
 
+// Normal kernel chunk MegaMoE (Plan B): C++ host-driven chunk loop.
+//
+// This is the C++ mirror of `fp8_fp4_chunked_mega_moe` (the Python wrapper that
+// loops in Python and re-calls the baseline kernel). Moving the loop into C++
+// removes the Python interpreter overhead between kernel launches while keeping
+// the simple "N kernel launches against a chunk-sized symm buffer" structure.
+//
+// Inputs `x`, `x_sf`, `topk_idx`, `topk_weights` carry the full T-token data
+// (not yet copied into the symm buffer). `sym_buffer` must have been allocated
+// with `chunk_tokens=chunk_size` capacity (the same allocator the Python
+// chunked path uses).
+static void fp8_fp4_normal_kernel_chunk_mega_moe(
+    const torch::Tensor& y,
+    const torch::Tensor& x_fp8,
+    const torch::Tensor& x_sf,
+    const torch::Tensor& topk_idx_in,
+    const torch::Tensor& topk_weights_in,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const int& total_tokens, const int& chunk_tokens,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math
+) {
+    // Plan A: kernel-internal chunk loop (single kernel launch).
+    // Replaces the prior host-side C++ for-loop (Plan B) which launched the
+    // baseline kernel N times. With Plan A, NVLink barriers cycle internally
+    // and only one cudaLaunchKernel is issued per call.
+
+    const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+    const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+
+    // Config checks
+    const auto [rm, rn, rk] = recipe;
+    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+    DG_HOST_ASSERT(activation == "swiglu");
+
+    // Activation checks
+    const auto activation_clamp =
+        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    DG_HOST_ASSERT(activation_clamp >= 0);
+
+    // Tensor checks
+    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
+    const auto arch_major = device_runtime->get_arch_major();
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
+        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
+        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+    DG_HOST_ASSERT(hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+    DG_HOST_ASSERT(chunk_tokens > 0 and chunk_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(total_tokens > 0 and total_tokens == static_cast<int>(y.size(0)));
+
+    // Weight SF layout
+    constexpr int kGranMN = 1, kGranK = 32;
+    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                    num_experts_per_rank, true, false, torch::kInt);
+    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                    num_experts_per_rank, true, false, torch::kInt);
+
+    // Stats counter
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+
+    // Buffer bytes (chunk-sized layout, byte-identical to Plan B)
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_experts_ = num_experts_per_rank * num_ranks;
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        true, activation);
+    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+    DG_HOST_ASSERT(num_experts == num_experts_);
+
+    // Slice symm-buffer once (chunk-sized regions, reused across all chunks)
+    auto [sym_x, sym_x_sf, sym_topk_idx, sym_topk_weights,
+          l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+
+    // Validate user-side input tensors
+    DG_HOST_ASSERT(x_fp8.size(0) == total_tokens and x_fp8.size(1) == hidden);
+    DG_HOST_ASSERT(x_sf.size(0) == total_tokens and x_sf.size(1) == hidden / 128);
+    DG_HOST_ASSERT(topk_idx_in.size(0) == total_tokens and topk_idx_in.size(1) == num_topk);
+    DG_HOST_ASSERT(topk_weights_in.size(0) == total_tokens and topk_weights_in.size(1) == num_topk);
+
+    // iter7: user inputs are passed directly as device pointers; the kernel's
+    // dispatch warps stage them into the chunk-sized symm slots in-kernel. No
+    // more host-side `sym_x.copy_(x_fp8)` placeholder.
+    if (arch_major == 10) {
+        sm100_fp8_fp4_internal_chunk_mega_moe(
+            y, x_fp8, x_sf, topk_idx_in, topk_weights_in,
+            l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+            l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
+            cumulative_local_expert_recv_stats,
+            sym_buffer_ptrs,
+            rank_idx, num_max_tokens_per_rank,
+            num_experts_per_rank,
+            total_tokens, chunk_tokens, num_topk,
+            hidden, intermediate_hidden,
+            activation_clamp, fast_math);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+
+    // Zero the entire symmetric buffer for debug mode
+    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+        sym_buffer.zero_();
+}
+
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("fp8_fp4_normal_kernel_chunk_mega_moe", &fp8_fp4_normal_kernel_chunk_mega_moe);
     m.def("get_symm_buffer_size_for_streaming_mega_moe", &get_symm_buffer_size_for_streaming_mega_moe);
     m.def("fp8_fp4_streaming_mega_moe", &fp8_fp4_streaming_mega_moe);
 #endif

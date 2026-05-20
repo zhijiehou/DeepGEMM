@@ -180,8 +180,17 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
+    // Previous chunk's accumulated high-bits and token counts (for epoch subtraction)
+    uint32_t prev_epoch_tokens[kNumExpertsPerLane] = {};
+
     CUTLASS_DEVICE void fetch_expert_recv_count() {
-        // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
+        fetch_expert_recv_count(0u);
+    }
+
+    CUTLASS_DEVICE void fetch_expert_recv_count(const uint32_t chunk_idx) {
+        // Epoch-based: expert_recv_count_sum accumulates across chunks.
+        // High 32 bits grow by kNumSMs*kNumRanks each chunk; low 32 bits grow by actual tokens.
+        const uint32_t expected_high = (chunk_idx + 1) * kNumSMs * kNumRanks;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
@@ -189,17 +198,29 @@ struct MegaMoEScheduler {
             if (expert_idx < kNumExpertsPerRank) {
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                } while (static_cast<uint32_t>(value >> 32) != expected_high);
             }
-            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+            // Subtract previous chunk's accumulated token count to get THIS chunk's count
+            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value) - prev_epoch_tokens[i];
+            prev_epoch_tokens[i] = static_cast<uint32_t>(value);
         }
         __syncwarp();
     }
 
     template <typename Func>
     CUTLASS_DEVICE void for_each_block(Func&& func) {
-        // Wait for all expert counters to be finalized
-        fetch_expert_recv_count();
+        for_each_block(0u, func);
+    }
+
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_block(const uint32_t chunk_idx, Func&& func) {
+        // iter10: reset per-chunk scheduler state (block_idx + next_phase advance through
+        // get_next_block; without reset they leak from previous chunk and cause OOB reads)
+        block_idx = blockIdx.x;
+        next_phase = BlockPhase::Linear1;
+
+        // Wait for all expert counters to be finalized (epoch-aware)
+        fetch_expert_recv_count(chunk_idx);
 
         // Initialize current expert with 0
         set_expert_idx(0);

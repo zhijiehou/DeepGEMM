@@ -177,6 +177,43 @@ def fp8_fp4_chunked_mega_moe(y: torch.Tensor,
         )
 
 
+def fp8_fp4_normal_kernel_chunk_mega_moe(y: torch.Tensor,
+                                          x: Tuple[torch.Tensor, torch.Tensor],
+                                          topk_idx: torch.Tensor,
+                                          topk_weights: torch.Tensor,
+                                          l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                                          l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                                          sym_buffer: SymmBuffer,
+                                          chunk_size: int,
+                                          cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                                          recipe: Tuple[int, int, int] = (1, 1, 32),
+                                          activation: str = 'swiglu',
+                                          activation_clamp: Optional[float] = None,
+                                          fast_math: bool = True):
+    """Normal-kernel chunked MegaMoE.
+
+    Plan B: C++ host-driven chunk loop. Same memory footprint as
+    ``fp8_fp4_chunked_mega_moe`` (sym_buffer allocated with ``chunk_tokens``)
+    but loop runs entirely inside C++ — fewer Python<->C++ round-trips than the
+    Python chunked path. Still N kernel launches per call (one per chunk).
+    """
+    total_tokens = x[0].size(0)
+    _C.fp8_fp4_normal_kernel_chunk_mega_moe(
+        y,
+        x[0], x[1], topk_idx, topk_weights,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        total_tokens, chunk_size,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
 class StreamingSymmBuffer:
     """Symmetric buffer for streaming MegaMoE with barrier compression.
 

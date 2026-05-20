@@ -87,6 +87,7 @@ from .mega import (
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
     fp8_fp4_chunked_mega_moe,
+    fp8_fp4_normal_kernel_chunk_mega_moe,
     StreamingSymmBuffer,
     get_streaming_symm_buffer_for_mega_moe,
     fp8_fp4_streaming_mega_moe,
